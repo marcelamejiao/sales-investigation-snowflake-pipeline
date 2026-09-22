@@ -1,296 +1,198 @@
-# Sales Investigation Snowflake Pipeline
+# Hamburg Weather and Sales Investigation
 
-An end-to-end Snowflake data pipeline for investigating a sales anomaly: sales in
-Hamburg, Germany dropped to `$0` for several days in February.
+An end-to-end Snowflake data pipeline that investigates a Hamburg, Germany
+sales anomaly and delivers an interactive weather-and-sales dashboard. The
+project follows the **Ingestion–Transformation–Delivery (I-T-D)** framework.
 
-The project is organized around the **Ingestion–Transformation–Delivery (I-T-D)**
-framework:
+## Business question
 
-```text
-Snowflake Marketplace ─┐
-                       ├─> Raw data ─> SQL/Python transformations ─> Curated data ─> Streamlit in Snowflake
-AWS S3 ────────────────┘
-```
+Tasty Bytes is a global food truck company. Analysts noticed that sales in
+Hamburg dropped to `$0` for several days in February 2022. This project
+combines daily sales with weather data to help explain the anomaly and provides
+a repeatable data product that analysts can use to monitor Hamburg.
 
-> **Repository status:** this repository currently contains the project
-> documentation only. The SQL, Python, and Streamlit objects described below are
-> the implementation blueprint for the pipeline and should be added as the
-> project is built.
-
-## What this project demonstrates
-
-- Snowflake as the platform for data engineering and analytics
-- Data sharing through the Snowflake Marketplace
-- Loading files from AWS S3 blob storage
-- A layered ingestion, transformation, and delivery architecture
-- Transformations using SQL, views, Python UDFs, and stored procedures
-- A final investigation product delivered with Streamlit in Snowflake
-
-## I-T-D architecture
-
-### 1. Ingestion
-
-The pipeline brings together two complementary sources:
-
-| Source | Typical role | Snowflake integration |
-| --- | --- | --- |
-| Snowflake Marketplace | Shared reference, demographic, geographic, or economic data used to explain sales patterns | Secure data share, database, and schema |
-| AWS S3 | Project sales files and other event-level extracts | Storage integration, external stage, file format, and `COPY INTO` |
-
-Keep ingested data immutable and close to its source. A typical database layout is:
+## Architecture
 
 ```text
-SALES_DB
-├── RAW          -- source-shaped tables loaded from S3
-├── MARKETPLACE  -- objects exposed by the Marketplace share
-├── TRANSFORMED  -- cleaned and modeled views/tables
-└── ANALYTICS    -- objects consumed by Streamlit
+Snowflake Marketplace             AWS S3
+Pelmorex weather data       Tasty Bytes operational data
+          │                              │
+          └──────────────┬───────────────┘
+                         ▼
+                 Snowflake raw schemas
+                         │
+             SQL views and Python UDFs
+                         │
+              harmonized.weather_hamburg
+                         │
+          Streamlit in Snowflake + Altair
 ```
 
-#### Marketplace data sharing
+## Ingestion
 
-After obtaining a Marketplace listing, create or select the shared database using
-the provider's instructions. Marketplace data is shared into the consumer account;
-it should not be copied unnecessarily.
+### Snowflake Marketplace
 
-```sql
--- The exact database and schema names depend on the listing.
-SHOW DATABASES;
-SHOW SCHEMAS IN DATABASE <MARKETPLACE_DATABASE>;
-SHOW TABLES IN SCHEMA <MARKETPLACE_DATABASE>.<MARKETPLACE_SCHEMA>;
+The pipeline uses the **Pelmorex Weather Source** Marketplace dataset,
+including daily temperature, precipitation, wind speed, postal-code, and city
+attributes. `01_Transformation/Hamburg_Sales.sql` joins the weather history to
+the Tasty Bytes country reference and creates
+`TASTY_BYTES.HARMONIZED.DAILY_WEATHER_V`, filtered to supported Tasty Bytes
+cities.
+
+Before running the transformation scripts, subscribe to the Pelmorex listing
+in the Snowflake Marketplace and make its shared database available in the
+account. The shared database name must match the object references in the SQL
+scripts, or those references must be updated for the target account.
+
+### AWS S3
+
+The Tasty Bytes source files are loaded from:
+
+```text
+s3://sfquickstarts/tasty-bytes-builder-education/
 ```
 
-Use the shared objects through documented contracts and grant the least
-privilege required by the pipeline role.
+`00_Ingestion/Marketplace_data_tasty_bytes.sql` creates the Snowflake database
+schemas, CSV file format, external stage, raw tables, harmonized views, and
+analytics views. It then loads:
 
-#### Loading AWS S3 data
+- Franchisees and trucks
+- Locations and menus
+- Order headers and order details
+- Customer loyalty data
 
-The exact bucket URL, file format, and AWS role are environment-specific and must
-be supplied through account configuration rather than committed to the
-repository.
+`00_Ingestion/AWS_countries_data.sql` loads the country and city reference
+table. `00_Ingestion/AWS_tasty_bytes_data.sql` contains the focused stage and
+country-table setup used for the S3 ingestion walkthrough.
 
-```sql
-CREATE OR REPLACE FILE FORMAT SALES_DB.RAW.SALES_CSV_FORMAT
-  TYPE = CSV
-  SKIP_HEADER = 1
-  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-  NULL_IF = ('', 'NULL');
+The scripts are written for the sample Tasty Bytes environment and use
+`ACCOUNTADMIN`, `COMPUTE_WH`, and `DEMO_BUILD_WH`. Review roles, warehouses,
+database names, and privileges before running them in another account.
 
-CREATE OR REPLACE STAGE SALES_DB.RAW.SALES_S3_STAGE
-  URL = 's3://<bucket>/<prefix>/'
-  STORAGE_INTEGRATION = <S3_STORAGE_INTEGRATION>
-  FILE_FORMAT = SALES_DB.RAW.SALES_CSV_FORMAT;
-
-CREATE OR REPLACE TABLE SALES_DB.RAW.SALES (
-  order_id       VARCHAR,
-  order_date     DATE,
-  city           VARCHAR,
-  country        VARCHAR,
-  product_id     VARCHAR,
-  quantity       NUMBER,
-  unit_price     NUMBER(18, 2),
-  loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-);
-
-COPY INTO SALES_DB.RAW.SALES
-  (order_id, order_date, city, country, product_id, quantity, unit_price)
-FROM @SALES_DB.RAW.SALES_S3_STAGE
-PATTERN = '.*[.]csv'
-ON_ERROR = 'CONTINUE';
-```
-
-In production, review rejected files from the `COPY INTO` load history, make
-loads idempotent, and avoid putting AWS credentials or account-specific
-configuration in source control.
-
-## 2. Transformation
-
-Transformations should be layered so that source data remains auditable and each
-step has a clear contract.
+## Transformation
 
 ### SQL and views
 
-First standardize dimensions and calculate the sales measure used by the
-investigation:
+The raw order tables are joined into
+`TASTY_BYTES.HARMONIZED.ORDERS_V`, which provides order dates, cities,
+countries, menu items, quantities, and prices. Analytics views expose the
+harmonized order data and customer loyalty metrics.
+
+`TASTY_BYTES.HARMONIZED.WEATHER_HAMBURG` combines February 2022 Hamburg
+weather with daily sales. It calculates:
+
+- Daily sales
+- Average temperature in Fahrenheit
+- Average temperature in Celsius
+- Average precipitation in inches
+- Average precipitation in millimeters
+- Maximum wind speed in miles per hour
+
+The sales investigation in `01_Transformation/Hamburg_Sales.sql` generates a
+complete February date series and left joins sales. This is important because
+dates with no matching orders remain in the result and are displayed as
+`$0` instead of disappearing from the analysis.
+
+### User-defined functions
+
+`01_Transformation/UDFs.sql` creates two reusable SQL UDFs:
 
 ```sql
-CREATE OR REPLACE VIEW SALES_DB.TRANSFORMED.SALES_ENRICHED AS
-SELECT
-  order_id,
-  order_date,
-  UPPER(TRIM(city)) AS city,
-  UPPER(TRIM(country)) AS country,
-  product_id,
-  quantity,
-  unit_price,
-  quantity * unit_price AS sales_amount
-FROM SALES_DB.RAW.SALES
-WHERE order_id IS NOT NULL
-  AND order_date IS NOT NULL
-  AND quantity >= 0
-  AND unit_price >= 0;
+TASTY_BYTES.ANALYTICS.FAHRENHEIT_TO_CELSIUS(temp_f)
+TASTY_BYTES.ANALYTICS.INCH_TO_MILLIMETER(inch)
 ```
 
-The investigation output can then aggregate by day and location:
+The UDFs enrich the Hamburg weather view with analyst-friendly unit
+conversions while keeping the aggregation and joins in SQL.
 
-```sql
-CREATE OR REPLACE VIEW SALES_DB.ANALYTICS.DAILY_CITY_SALES AS
-SELECT
-  order_date,
-  city,
-  country,
-  SUM(sales_amount) AS total_sales,
-  COUNT(DISTINCT order_id) AS order_count,
-  SUM(quantity) AS units_sold
-FROM SALES_DB.TRANSFORMED.SALES_ENRICHED
-GROUP BY order_date, city, country;
-```
+## Delivery: Streamlit in Snowflake
 
-The anomaly can be isolated with a targeted query:
+`03_Delivery/HAMBURG_GERMANY_TRENDS/streamlit_app.py` is a Python Streamlit
+application that:
 
-```sql
-SELECT *
-FROM SALES_DB.ANALYTICS.DAILY_CITY_SALES
-WHERE city = 'HAMBURG'
-  AND country = 'GERMANY'
-  AND total_sales = 0
-ORDER BY order_date;
-```
+1. Reads `TASTY_BYTES.HARMONIZED.WEATHER_HAMBURG` with the active Snowpark
+   session.
+2. Converts sales to millions of dollars for chart readability.
+3. Reshapes the weather metrics for visualization.
+4. Renders an interactive Altair line chart with independent sales and weather
+   axes.
 
-### Python UDFs
-
-Use a Python UDF for reusable row-level logic that is awkward to express in
-plain SQL. Keep aggregations and joins in SQL so Snowflake can optimize them.
-
-```sql
-CREATE OR REPLACE FUNCTION SALES_DB.TRANSFORMED.NORMALIZE_CITY(city VARCHAR)
-RETURNS VARCHAR
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.11'
-HANDLER = 'normalize_city'
-AS
-$$
-def normalize_city(city):
-    return city.strip().upper() if city else None
-$$;
-```
-
-### Stored procedures
-
-Use a stored procedure to orchestrate repeatable pipeline steps, such as
-refreshing derived tables after ingestion. A procedure should validate inputs,
-fail explicitly when a step fails, and return an operational status that can be
-logged by the caller.
-
-```sql
-CREATE OR REPLACE PROCEDURE SALES_DB.TRANSFORMED.REFRESH_ANALYTICS()
-RETURNS VARCHAR
-LANGUAGE SQL
-AS
-$$
-BEGIN
-  CREATE OR REPLACE TABLE SALES_DB.ANALYTICS.DAILY_CITY_SALES_TABLE AS
-  SELECT *
-  FROM SALES_DB.ANALYTICS.DAILY_CITY_SALES;
-  RETURN 'Analytics refresh completed';
-END;
-$$;
-```
-
-For larger workloads, the procedure can be invoked by a Snowflake task after a
-successful load. Tasks and schedules should be configured per environment.
-
-## 3. Delivery with Streamlit in Snowflake
-
-The final data product is a Streamlit in Snowflake application that allows an
-analyst to:
-
-- Select a date range, city, and country
-- See daily sales, order count, and units sold
-- Identify the zero-sales period in Hamburg
-- Compare Hamburg with other cities or with the same period in prior data
-- Inspect the underlying rows or quality indicators before drawing a conclusion
-
-### Dashboard preview
-
-![Weather and sales trends for Hamburg, Germany](assets/hamburg-weather-sales-dashboard.png)
-
-Open the live [Hamburg Weather and Sales Trends Streamlit dashboard in
-Snowflake](https://app.snowflake.com/streamlit/qatgdik/bl54232/#/apps/TASTY_BYTES.HARMONIZED.HAMBURG_GERMANY_TRENDS).
-
-A minimal Streamlit application can query the curated view using the Snowpark
-session provided by Streamlit in Snowflake:
-
-```python
-import streamlit as st
-
-session = st.connection("snowflake").session()
-
-st.title("Sales investigation")
-st.caption("Investigating the Hamburg sales drop")
-
-city = st.text_input("City", "HAMBURG").strip().upper()
-country = st.text_input("Country", "GERMANY").strip().upper()
-
-query = """
-    SELECT order_date, total_sales, order_count, units_sold
-    FROM SALES_DB.ANALYTICS.DAILY_CITY_SALES
-    WHERE city = ?
-      AND country = ?
-    ORDER BY order_date
-"""
-data = session.sql(query, params=[city, country]).to_pandas()
-
-st.line_chart(data.set_index("ORDER_DATE")["TOTAL_SALES"])
-st.dataframe(data, use_container_width=True)
-```
-
-The application should read from curated objects, not raw S3 tables, and its
-owning role should have only the `USAGE` and `SELECT` privileges it needs.
-
-## Recommended implementation sequence
-
-1. Create the database, schemas, roles, and warehouse for the target
-   environment.
-2. Configure the AWS storage integration and validate access to the S3 prefix.
-3. Create the S3 file format, stage, raw table, and first `COPY INTO` load.
-4. Subscribe to the required Snowflake Marketplace listing and document its
-   schema and refresh behavior.
-5. Add cleaning and business-rule transformations as SQL views.
-6. Add Python UDFs only for reusable logic that benefits from Python.
-7. Add a stored procedure or task to refresh the analytics layer.
-8. Build the Streamlit in Snowflake app against the analytics views.
-9. Validate the Hamburg zero-sales result against source rows and load history.
-10. Add monitoring for load failures, rejected files, stale Marketplace data,
-    and unexpected nulls or negative measures.
-
-## Security and operational practices
-
-- Store credentials, bucket names, integration names, and account identifiers in
-  Snowflake administration or deployment configuration, not in Git.
-- Use separate roles for ingestion, transformation, and Streamlit consumption.
-- Grant access to curated views instead of exposing raw data by default.
-- Keep raw source data immutable and include load timestamps and source-file
-  metadata where possible.
-- Test row counts, null rates, duplicate keys, date coverage, and monetary
-  totals after every load.
-- Record the Marketplace provider, listing version, and refresh assumptions so
-  analytical results remain reproducible.
-
-## Project outcome
-
-The completed pipeline will provide a governed path from shared and cloud-hosted
-data to an interactive investigation product:
+The Streamlit deployment configuration is in:
 
 ```text
-Sources
-  -> Snowflake ingestion
-  -> SQL/Python cleansing and business logic
-  -> Views and analytics tables
-  -> Streamlit investigation dashboard
+03_Delivery/HAMBURG_GERMANY_TRENDS/
+├── pyproject.toml
+├── snowflake.yml
+├── streamlit_app.py
+└── .streamlit/config.toml
 ```
 
-The primary analytical question is why Hamburg recorded `$0` in sales for
-several February days. The pipeline is designed to answer that question with
-traceable source data, repeatable transformations, and a consumable Snowflake
-application rather than a one-off spreadsheet analysis.
+The dashboard preview is available in
+`assets/hamburg-weather-sales-dashboard.png`.
+
+## Analytics result
+
+The dashboard shows the following February 2022 pattern:
+
+- Hamburg has regular daily sales before the anomaly, generally around
+  `$27–$37 million`.
+- Sales fall to `$0` for seven consecutive days, from **February 15 through
+  February 21, 2022**.
+- Sales resume on February 22 at approximately `$41 million`, followed by
+  normal daily variation through the end of the month.
+- Weather data remains populated during the zero-sales period. Temperature,
+  precipitation, and wind-speed series continue across the same dates.
+- The yellow **Max Wind Speed (mph)** series increases during the zero-sales
+  period and reaches its highest level around February 19, before declining
+  toward February 22.
+The combined view makes the anomaly traceable: analysts can compare the
+zero-sales interval with weather conditions and then inspect the underlying
+order and load data for the affected dates.
+
+![Weather and Sales Trends for Hamburg, Germany](assets/hamburg-weather-sales-dashboard.png)
+
+## Repository layout
+
+```text
+00_Ingestion/
+├── AWS_countries_data.sql
+├── AWS_tasty_bytes_data.sql
+└── Marketplace_data_tasty_bytes.sql
+
+01_Transformation/
+├── Hamburg_Sales.sql
+└── UDFs.sql
+
+03_Delivery/HAMBURG_GERMANY_TRENDS/
+├── pyproject.toml
+├── snowflake.yml
+├── streamlit_app.py
+└── .streamlit/config.toml
+
+assets/
+└── hamburg-weather-sales-dashboard.png
+```
+
+## Running the pipeline
+
+1. Create or select a Snowflake database named `TASTY_BYTES`.
+2. Confirm the required warehouse and role, or adjust the scripts for the
+   target environment.
+3. Subscribe to the Pelmorex Weather Source Marketplace listing.
+4. Run `00_Ingestion/Marketplace_data_tasty_bytes.sql` to create and load the
+   Tasty Bytes raw and analytics objects.
+5. Run `00_Ingestion/AWS_countries_data.sql` if the country reference table is
+   not already loaded.
+6. Run `01_Transformation/UDFs.sql` to create the conversion functions.
+7. Run `01_Transformation/Hamburg_Sales.sql` to create the weather views and
+   inspect the February sales and weather results.
+8. Deploy `03_Delivery/HAMBURG_GERMANY_TRENDS` as a Streamlit in Snowflake
+   application using Snowflake CLI and the included `snowflake.yml`.
+
+You can also run the Streamlit application directly in Snowflake Cloud from
+the Workspace by opening `03_Delivery/HAMBURG_GERMANY_TRENDS/streamlit_app.py`
+in the Streamlit editor and running the app there.
+
+Do not commit credentials, storage integrations, account identifiers, or
+private Marketplace configuration to the repository. Use environment-specific
+Snowflake administration and deployment settings for those values.
