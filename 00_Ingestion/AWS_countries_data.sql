@@ -7,14 +7,14 @@ CREATE OR REPLACE SCHEMA raw_pos;
 CREATE OR REPLACE FILE FORMAT tasty_bytes.public.csv_ff
 type = 'csv';
 
-
+-- Create a stage
 -- Specify the file format below:
 CREATE OR REPLACE STAGE tasty_bytes.public.s3load
 url = 's3://sfquickstarts/tasty-bytes-builder-education/'
 file_format = tasty_bytes.public.csv_ff;
 
 
--- country table build
+-- Build a table for country
 CREATE OR REPLACE TABLE tasty_bytes.raw_pos.country
 (
    country_id NUMBER(18,0),
